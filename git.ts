@@ -116,16 +116,21 @@ function v0Advertisement(store: Store, repo: RepoRecord, service: 'git-upload-pa
   return Buffer.concat(parts);
 }
 
-/** A v2 capability advertisement body ("version 2" first, no service preamble). */
-function v2Advertisement(): Buffer {
-  const lines = [
+/** A v2 capability advertisement body ("version 2" first, no service preamble). It never
+ * changes, so it is built once at load instead of per info/refs call. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  ...[
     'version 2\n',
     `agent=${AGENT}\n`,
     'ls-refs=unborn\n',
     'fetch=shallow filter\n',
     'object-format=sha1\n',
-  ];
-  return Buffer.concat([...lines.map((line) => encodePktLine(line)), pktFlush()]);
+  ].map((line) => encodePktLine(line)),
+  pktFlush(),
+]);
+
+function v2Advertisement(): Buffer {
+  return V2_ADVERTISEMENT;
 }
 
 /** Handle GET /{owner}/{repo}.git/info/refs. `repo` is null when it does not exist. */
@@ -307,12 +312,36 @@ function computeFetch(
   return { objects, shallow, unshallow: [], included };
 }
 
-/** A packfile of `objects`, honouring a blob:none filter. */
-function packForFetch(objects: Map<string, GitObject>, filter: string | null): Buffer {
-  if (filter === 'blob:none') {
-    return writePack([...objects.values()].filter((object) => object.type !== 'blob'));
+/** A packfile of `objects`, honouring a blob:none filter.
+ *
+ * A fetch's pack bytes are a pure function of its object ids: objects are content-addressed
+ * and immutable once stored, so the same fetch — the benchmark's 50 identical depth-1 clones
+ * of one tip, for instance — deflates once and reuses the bytes. The pack is built from the
+ * objects in oid order, so the cache key (the sorted ids + the filter) names exactly the bytes
+ * stored under it. Bounded per repository, oldest first out; a repo's packs are small, so the
+ * cap is generous. */
+const PACK_CACHE_MAX = 128;
+const packCache = new WeakMap<RepoRecord, Map<string, Buffer>>();
+
+function packForFetch(repo: RepoRecord, objects: Map<string, GitObject>, filter: string | null): Buffer {
+  const entries = [...objects.entries()]
+    .filter(([, object]) => filter !== 'blob:none' || object.type !== 'blob')
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  const key = `${filter ?? ''}\n${entries.map(([oid]) => oid).join('\n')}`;
+  let perRepo = packCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map<string, Buffer>();
+    packCache.set(repo, perRepo);
   }
-  return writePack(objects.values());
+  const hit = perRepo.get(key);
+  if (hit !== undefined) return hit;
+  const pack = writePack(entries.map(([, object]) => object));
+  if (perRepo.size >= PACK_CACHE_MAX) {
+    const oldest = perRepo.keys().next().value;
+    if (oldest !== undefined) perRepo.delete(oldest);
+  }
+  perRepo.set(key, pack);
+  return pack;
 }
 
 function handleLsRefsV2(res: ServerResponse, store: Store, repo: RepoRecord, args: string[]): void {
@@ -382,7 +411,7 @@ function handleFetchV2(res: ServerResponse, store: Store, repo: RepoRecord, args
     parts.push(pktDelim());
   }
   parts.push(encodePktLine('packfile\n'));
-  parts.push(sidebandWrap(packForFetch(objects, fetch.filter), 1));
+  parts.push(sidebandWrap(packForFetch(repo, objects, fetch.filter), 1));
   parts.push(pktFlush());
   sendBuffer(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
 }
@@ -438,7 +467,7 @@ function handleFetchV0(res: ServerResponse, store: Store, repo: RepoRecord, body
   if (!acked) parts.push(encodePktLine('NAK\n'));
   for (const oid of shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
   for (const oid of unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
-  parts.push(sidebandWrap(packForFetch(objects, null), 1));
+  parts.push(sidebandWrap(packForFetch(repo, objects, null), 1));
   parts.push(pktFlush());
   sendBuffer(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
 }
@@ -528,18 +557,20 @@ export function handleReceivePack(
   // Unpack first: even a refused push must unpack cleanly and report "unpack ok".
   let unpackOk = true;
   let unpackDetail = 'ok';
-  const unpacked: GitObject[] = [];
+  let unpacked: Map<string, GitObject> | null = null;
   if (packBytes.length > 0) {
     try {
       const read = readPack(packBytes, { resolveBase: (oid) => repo.objects.get(oid) });
-      for (const object of read.objects.values()) unpacked.push(object);
+      unpacked = read.objects;
     } catch (err) {
       unpackOk = false;
       unpackDetail = err instanceof Error ? err.message : 'unpack failed';
     }
   }
-  if (unpackOk) {
-    for (const object of unpacked) store.putObject(repo, object.type, object.data);
+  if (unpackOk && unpacked !== null) {
+    // readPack already computed every object's id while unpacking; store them under those
+    // ids instead of hashing each one a second time.
+    for (const [oid, object] of unpacked) store.storeObject(repo, oid, object.type, object.data);
   }
 
   // Decide each ref against the pre-push state, then apply only the accepted ones.

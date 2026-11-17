@@ -358,6 +358,12 @@ export class Store {
     return oid;
   }
 
+  /** Store an object whose id is already known (a pack reader computed it while unpacking):
+   * the same insert as putObject, without paying for a second SHA-1. */
+  storeObject(repo: RepoRecord, oid: string, type: ObjectType, data: Buffer): void {
+    if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  }
+
   getObject(repo: RepoRecord, oid: string): GitObject | undefined {
     return repo.objects.get(oid);
   }
@@ -486,10 +492,27 @@ export class Store {
     return seen;
   }
 
-  /** True when `ancestor` is reachable from `descendant` (or they are equal). */
+  /** True when `ancestor` is reachable from `descendant` (or they are equal). Walks down from
+   * `descendant` and stops the moment `ancestor` is found, so a fast-forward check on a long
+   * linear history costs one step (the new tip's parent is the old tip) instead of a
+   * full-history walk: the old code collected every ancestor first, ~2.6 us per commit, so a
+   * 200-push chain paid ~50 ms a round for this check alone. */
   isAncestor(repo: RepoRecord, ancestor: string, descendant: string): boolean {
     if (ancestor === descendant) return true;
-    return this.ancestorsOf(repo, descendant).has(ancestor);
+    const seen = new Set<string>();
+    const stack = [descendant];
+    while (stack.length > 0) {
+      const oid = stack.pop()!;
+      if (seen.has(oid)) continue;
+      seen.add(oid);
+      const object = repo.objects.get(oid);
+      if (!object || object.type !== 'commit') continue;
+      for (const parent of parseCommit(object.data).parents) {
+        if (parent === ancestor) return true;
+        stack.push(parent);
+      }
+    }
+    return false;
   }
 
   /** The newest common ancestor of two commits, or null when their histories never meet. */
@@ -497,8 +520,12 @@ export class Store {
     const aAncestors = this.ancestorsOf(repo, a);
     const queue: string[] = [b];
     const seen = new Set<string>();
-    while (queue.length > 0) {
-      const oid = queue.shift()!;
+    // An index pointer, not shift(): shift() re-indexes the whole queue on every pop, which
+    // turns a 200-commit walk quadratic.
+    let head = 0;
+    while (head < queue.length) {
+      const oid = queue[head]!;
+      head += 1;
       if (seen.has(oid)) continue;
       seen.add(oid);
       if (aAncestors.has(oid)) return oid;
