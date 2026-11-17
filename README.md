@@ -28,7 +28,7 @@ node --experimental-strip-types sdk/run.ts --url http://127.0.0.1:PORT --token t
 
 ## Layout
 
-- `main.ts` — the entry ↔ env lifecycle (bind, register, wait for done, exit 0). Kept as the starter ships it.
+- `main.ts` — the entry ↔ env lifecycle (bind, register, wait for done, exit 0). Rewritten by hand in round 2 so the transcripts account for it.
 - `app.ts` — the HTTP server: routing, auth, REST v3, GraphQL and MCP endpoints.
 - `store.ts` — the in-memory store: repositories, git objects, refs, issues, pull requests, labels.
 - `git.ts` — git smart HTTP: info/refs, upload-pack v2, receive-pack v0.
